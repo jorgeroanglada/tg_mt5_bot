@@ -1,0 +1,18 @@
+# Secretos: claves de Telegram, Gemini y MT5. NUNCA subirlos.
+.env
+*.session
+*.session-journal
+
+# Datos privados de la cuenta y del grupo
+estado.json
+bot.log
+*.log
+
+# Notas internas para Claude Code (datos personales del entorno)
+CLAUDE.md
+
+# Python
+venv/
+.venv/
+__pycache__/
+*.pyc
