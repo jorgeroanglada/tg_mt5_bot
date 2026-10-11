@@ -12,6 +12,20 @@ Lee los mensajes de un grupo/canal de Telegram (con tu propia cuenta, no hace fa
 
 **Cifras:** 9 archivos de Python (1.364 líneas), montado en dos días con Claude Code. 245 mensajes interpretados en sus primeros días.
 
+### Cómo funciona
+
+```mermaid
+flowchart LR
+    A[Mensaje del grupo<br/>de Telegram] --> B[IA: Gemini / Groq<br/>texto → acción en JSON]
+    B --> C{¿Confianza ≥ 0,7?}
+    C -- No --> D[No hace nada<br/>y me avisa]
+    C -- Sí --> E{Barreras de seguridad<br/>símbolo permitido · límite diario<br/>máx. señales · spread}
+    E -- Bloqueada --> D
+    E -- OK --> F[MetaTrader 5<br/>abre · mueve SL · cierra parcial]
+    F --> G[Aviso al móvil<br/>en Telegram]
+    F --> H[Informe semanal<br/>automático]
+```
+
 <!-- Añade aquí una captura de los avisos del bot en Telegram (sin importes): ![Avisos del bot](docs/avisos.png) -->
 
 ### Lo que aprendí
