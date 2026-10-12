@@ -27,9 +27,12 @@ def _senales(desde):
     todos = mt5.history_deals_get(desde - timedelta(days=30), hasta) or []
     abiertas = {p.ticket for p in (mt5.positions_get() or [])}
 
+    # Posiciones abiertas por el bot. Se cogen TODOS sus deals: si la cierras tú a mano en MT5,
+    # ese cierre no lleva la marca (magic) del bot, pero también cuenta.
+    del_bot = {d.position_id for d in todos if d.entry == 0 and d.magic == config.MAGIC}
     por_pos = defaultdict(list)
     for d in todos:
-        if d.magic == config.MAGIC and d.position_id:
+        if d.position_id in del_bot:
             por_pos[d.position_id].append(d)
 
     senales = {}

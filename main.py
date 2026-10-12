@@ -10,16 +10,22 @@ import asyncio
 import json
 import logging
 import sys
+import time
 from datetime import datetime, timedelta, timezone
+from logging.handlers import RotatingFileHandler
 
 import config
 
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(name)s] %(message)s",
-    handlers=[logging.FileHandler("bot.log", encoding="utf-8"), logging.StreamHandler(sys.stdout)],
+    handlers=[RotatingFileHandler("bot.log", maxBytes=5_000_000, backupCount=3, encoding="utf-8"),
+              logging.StreamHandler(sys.stdout)],
 )
 log = logging.getLogger("bot")
+
+# Acciones que tocan dinero: si no se sabe a qué señal van, se avisa en vez de callar
+_IMPORTANTES = {"mover_sl", "mover_tp", "breakeven", "cerrar_todo", "cerrar_be", "cerrar_parcial"}
 
 
 class Bot:
@@ -33,6 +39,9 @@ class Bot:
         self.parser = SignalParser()
         self.store = Store()
         self.lock = asyncio.Lock()
+        self.inflight = set()  # mensajes que se están procesando ahora mismo
+        self.mt5_ok = True
+        self.last_msg = None
 
     async def notify(self, text):
         log.info(text.replace("\n", " | "))
@@ -44,23 +53,28 @@ class Bot:
 
     # ---------------------------------------------------------------- objetivos de gestión
     def targets(self, chat_id, a, reply_id):
+        """Señales a las que se aplica una acción de gestión.
+        Devuelve None si el mensaje responde a algo que el bot no conoce (no se toca nada)."""
         active = self.store.active(chat_id)
         if not active:
             return []
+        obj = a.get("objetivo") or "ultima"
+        if obj == "todas":
+            return active
+        if reply_id:
+            # El mensaje al que responde manda sobre lo que diga la IA
+            ids = self.store.resolve_reply(f"{chat_id}:{reply_id}")
+            if ids is not None:
+                sigs = [self.store.get(i) for i in ids]
+                return [s for s in sigs if s and not s["closed"]]
+            if obj == "respondido":
+                return None
         named = [i for i in (a.get("senal_ids") or []) if self.store.get(i)]
         ids = [i for i in named if not self.store.get(i)["closed"]]
         if ids:
             return [self.store.get(i) for i in ids]
         if named:
             return []  # la IA nombró señales concretas y ya están cerradas: no tocar otra distinta
-        obj = a.get("objetivo") or "ultima"
-        if obj == "respondido" and reply_id:
-            s = self.store.get(f"{chat_id}:{reply_id}")
-            if s:
-                # responde a una señal concreta: si ya está cerrada, no se aplica a ninguna otra
-                return [] if s["closed"] else [s]
-        if obj == "todas":
-            return active
         if obj == "simbolo" and a.get("simbolo"):
             sym = self.ex.resolve_symbol(a["simbolo"])
             match = [s for s in active if s["symbol"] == sym]
@@ -78,37 +92,60 @@ class Bot:
             log.info("Mensaje ignorado por antiguo (%ds)", age)
             return
 
+        key = f"{chat_id}:{msg.id}"
+        if edited:
+            # Si el mensaje original aún se está procesando, esperar a que acabe
+            for _ in range(450):
+                if key not in self.inflight:
+                    break
+                await asyncio.sleep(0.2)
+            # Una edición solo sirve para corregir el SL/TP de una señal que ya abrimos: sin señal, ni preguntar a la IA
+            if not self.store.get(key):
+                log.info("Mensaje %s editado: no es una señal abierta por el bot, se ignora", key)
+                return
+        self.inflight.add(key)
+        try:
+            await self._handle(msg, chat_id, key, text, edited)
+        finally:
+            self.inflight.discard(key)
+
+    async def _handle(self, msg, chat_id, key, text, edited):
+        self.last_msg = datetime.now()
         reply_text, reply_id = None, None
         if msg.is_reply:
             r = await msg.get_reply_message()
             if r:
                 reply_text, reply_id = r.message, r.id
+            else:
+                reply_id = msg.reply_to_msg_id
+        log.info("Mensaje %s%s%s: %s", key, " (editado)" if edited else "",
+                 f" (responde a {reply_id})" if reply_id else "", text.replace("\n", " | ")[:500])
 
-        key = f"{chat_id}:{msg.id}"
+        # La IA trabaja fuera del bloqueo: mientras piensa, el bot sigue gestionando las operaciones
+        try:
+            res = await self.parser.parse(text, reply_text, self.store.active(chat_id))
+        except Exception as e:  # noqa: BLE001
+            log.exception("Error de la IA")
+            await self.notify(f"⚠️ La IA no ha podido leer este mensaje y NO se ha hecho nada ({e}). "
+                              f"Revísalo tú en MT5:\n{text[:300]}")
+            return
+        acciones = res.get("acciones", [])
+        log.info("IA: %s", json.dumps(res, ensure_ascii=False))
+        if not acciones:
+            return
+        if res.get("confianza", 0) < config.MIN_CONFIDENCE:
+            await self.notify(f"🤔 Mensaje ambiguo, NO ejecutado ({res.get('confianza')}):\n{text[:300]}\n→ {res.get('motivo')}")
+            return
+
         async with self.lock:
-            active = self.store.active(chat_id)
-            try:
-                res = await self.parser.parse(text, reply_text, active)
-            except Exception as e:  # noqa: BLE001
-                log.exception("Error de la IA")
-                await self.notify(f"⚠️ Error interpretando mensaje: {e}")
-                return
-            acciones = res.get("acciones", [])
-            log.info("IA: %s", json.dumps(res, ensure_ascii=False))
-            if not acciones:
-                return
-            if res.get("confianza", 0) < config.MIN_CONFIDENCE:
-                await self.notify(f"🤔 Mensaje ambiguo, NO ejecutado ({res.get('confianza')}):\n{text[:300]}\n→ {res.get('motivo')}")
-                return
-
             for a in acciones:
                 try:
-                    await self.run_action(a, key, chat_id, reply_id, edited)
+                    await self.run_action(a, key, chat_id, reply_id, edited, text)
                 except Exception as e:  # noqa: BLE001
                     log.exception("Error ejecutando acción")
                     await self.notify(f"⚠️ Error ejecutando {a.get('tipo')}: {e}")
 
-    async def run_action(self, a, key, chat_id, reply_id, edited):
+    async def run_action(self, a, key, chat_id, reply_id, edited, text=""):
         tipo = a["tipo"]
 
         if tipo == "abrir":
@@ -152,16 +189,23 @@ class Bot:
             log.info("Acción %s de un mensaje editado: ignorada", tipo)
             return
         sigs = self.targets(chat_id, a, reply_id)
+        if sigs is None:
+            log.info("Acción %s: responde a un mensaje que el bot no tiene registrado", tipo)
+            if tipo in _IMPORTANTES:
+                await self.notify(f"🤷 El grupo pide «{tipo}» respondiendo a una señal que el bot no abrió. "
+                                  f"No he tocado nada; revisa MT5 por si acaso:\n{text[:200]}")
+            return
         if not sigs:
             log.info("Acción %s sin señales abiertas a las que aplicar", tipo)
             return
+        self.store.add_ref(key, [s["id"] for s in sigs])  # para entender respuestas a este mensaje
         for s in sigs:
             if tipo == "tp_alcanzado" and self.ex.only_pending(s):
                 # El grupo ya cobra el TP y nuestra orden pendiente ni se abrió: entraríamos tarde
                 out = "⌛ " + self.ex.cancel_pending(s) + " (el grupo ya ha llegado al TP sin que entrara)"
             elif tipo == "breakeven":
-                out = self.ex.breakeven(s)
-                self.store.update(s["id"], be_done=True)
+                out, pendientes = self.ex.breakeven(s)
+                self.store.update(s["id"], be_done=True, be_pending=bool(pendientes))
             elif tipo == "tp_alcanzado" and s.get("mode") == "parciales":
                 notas = self.ex.take_partials(s, self.store, upto=a.get("tp_numero") or 1)
                 if not notas:
@@ -169,12 +213,13 @@ class Bot:
                 out = "\n".join(notas)
             elif tipo == "tp_alcanzado":
                 if config.MOVE_BE_ON_TP1 and not s["be_done"]:
-                    out = self.ex.breakeven(s)
-                    self.store.update(s["id"], be_done=True)
+                    out, pendientes = self.ex.breakeven(s)
+                    self.store.update(s["id"], be_done=True, be_pending=bool(pendientes))
                 else:
                     continue
             elif tipo == "mover_sl" and a.get("nuevo_sl"):
                 out = self.ex.move_sl(s, a["nuevo_sl"])
+                self.store.update(s["id"], sl=a["nuevo_sl"], be_pending=False)
             elif tipo == "mover_tp" and a.get("nuevos_tps"):
                 out = self.ex.move_tp(s, a["nuevos_tps"])
                 self.store.update(s["id"], tps=a["nuevos_tps"])
@@ -192,9 +237,36 @@ class Bot:
                 continue
             await self.notify(out)
 
+    # ---------------------------------------------------------------- bucles de fondo
+    async def check_mt5(self):
+        """Comprueba que MT5 sigue conectado; si no, avisa y reintenta conectar."""
+        estado = self.ex.health()
+        if estado is None:
+            if self.mt5_ok:
+                await self.notify("⚠️ Se ha perdido la conexión con MT5. Reintentando cada 30 s…")
+                self.mt5_ok = False
+            self.ex.reconnect()
+            return False
+        if not self.mt5_ok:
+            self.mt5_ok = True
+            await self.notify("✅ Conexión con MT5 recuperada")
+        if estado:  # aviso puntual (p.ej. Algo Trading desactivado)
+            await self.notify(estado)
+        return True
+
     async def maintenance_loop(self):
+        last_check = 0.0
         while True:
             await asyncio.sleep(2)
+            if time.time() - last_check > (15 if self.mt5_ok else 30):
+                last_check = time.time()
+                try:
+                    if not await self.check_mt5():
+                        continue
+                except Exception:  # noqa: BLE001
+                    log.exception("Error comprobando MT5")
+            if not self.mt5_ok:
+                continue
             async with self.lock:
                 try:
                     for n in self.ex.maintenance(self.store):
@@ -207,6 +279,12 @@ class Bot:
         async with self.lock:
             text = informe.generar(dias or config.REPORT_DAYS)
         await self.notify(text)
+
+    async def send_status(self):
+        async with self.lock:
+            text = self.ex.status_text(self.store)
+        ultimo = f"{self.last_msg:%d/%m %H:%M}" if self.last_msg else "ninguno desde que arrancó"
+        await self.notify(f"{text}\nÚltimo mensaje del grupo procesado: {ultimo}")
 
     async def report_loop(self):
         """Envía el informe una vez por semana (el día y la hora de REPORT_WEEKDAY / REPORT_HOUR).
@@ -305,11 +383,20 @@ async def run():
             log.exception("Error generando el informe")
             await bot.notify(f"⚠️ Error generando el informe: {e}")
 
+    # Escribe "/estado" para saber si el bot está vivo y qué tiene abierto
+    @client.on(events.NewMessage(chats="me", outgoing=True, pattern=r"(?i)^/estado\s*$"))
+    async def on_status(event):
+        try:
+            await bot.send_status()
+        except Exception as e:  # noqa: BLE001
+            log.exception("Error en /estado")
+            await bot.notify(f"⚠️ Error en /estado: {e}")
+
     modo = "SIMULACIÓN (DRY_RUN)" if config.DRY_RUN else "REAL"
     lotaje = (f"{config.LOT_PER_100} lotes por cada 100 € de capital" if config.LOT_PER_100
               else f"Riesgo {config.RISK_PERCENT}% por señal")
     await bot.notify(f"🤖 Bot iniciado en modo {modo}. {lotaje}. "
-                     f"Escuchando {len(config.TG_CHATS)} chat(s).")
+                     f"Escuchando {len(config.TG_CHATS)} chat(s). Escribe /estado para ver cómo va.")
     asyncio.create_task(bot.maintenance_loop())
     asyncio.create_task(bot.report_loop())
     await client.run_until_disconnected()

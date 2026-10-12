@@ -120,12 +120,23 @@ class Executor:
             return t, None
         modes = self._fillings(req["symbol"], req.get("action") == mt5.TRADE_ACTION_PENDING) if fill else [None]
         err = "sin respuesta"
+        precio_cambiado = (mt5.TRADE_RETCODE_REQUOTE, mt5.TRADE_RETCODE_PRICE_CHANGED, mt5.TRADE_RETCODE_PRICE_OFF)
         for m in modes:
             if m is not None:
                 req["type_filling"] = m
-            r = mt5.order_send(req)
+            for _ in range(3):
+                r = mt5.order_send(req)
+                if r is None:
+                    err = str(mt5.last_error())
+                    break
+                if r.retcode in precio_cambiado and req.get("action") == mt5.TRADE_ACTION_DEAL:
+                    # El oro se movió mientras enviábamos: reintentar con el precio de ahora
+                    tick = mt5.symbol_info_tick(req["symbol"])
+                    req["price"] = tick.ask if req["type"] == mt5.ORDER_TYPE_BUY else tick.bid
+                    err = f"{r.retcode} {r.comment}"
+                    continue
+                break
             if r is None:
-                err = str(mt5.last_error())
                 continue
             if r.retcode in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED, mt5.TRADE_RETCODE_DONE_PARTIAL):
                 return (r.order or True), None  # SL/TP no devuelve número de orden
@@ -136,6 +147,13 @@ class Executor:
                 break
         log.error("Orden rechazada: %s | %s", err, req)
         return None, err
+
+    @staticmethod
+    def _comment(key):
+        """Comentario de la orden: 'tg<id del mensaje>'. Las señales tuyas (/s, chat con id positivo)
+        llevan una 'm' al final para no mezclarse en el informe con un mensaje del grupo del mismo número."""
+        chat, _, msg_id = key.rpartition(":")
+        return f"tg{msg_id}{'' if chat.startswith('-') else 'm'}"[:31]
 
     # ------------------------------------------------------------------ abrir
     def open_signal(self, key, a):
@@ -229,6 +247,18 @@ class Executor:
             if total <= 0:
                 return None, (f"Riesgo {risk_money:.2f} demasiado pequeño para el lote mínimo "
                               f"({info.volume_min}) con ese SL")
+        # --- margen: si no cabe el lote entero, abrir el máximo que permita el margen libre
+        nota_margen = ""
+        mtype = mt5.ORDER_TYPE_BUY if buy else mt5.ORDER_TYPE_SELL
+        margin = mt5.order_calc_margin(mtype, symbol, total, entry)
+        free = acc.margin_free * 0.95  # 5 % de colchón para que el precio pueda moverse
+        if margin and margin > free:
+            reducido = self.normalize_volume(symbol, total * free / margin)
+            if reducido <= 0:
+                return None, f"No hay margen libre suficiente ({acc.margin_free:.0f} {acc.currency}) para abrir más"
+            nota_margen = f"\n⚠️ Lote reducido de {total} a {reducido} por falta de margen libre"
+            total = reducido
+
         if mode == "dividir":
             # Una posición por TP: repartir el volumen (en múltiplos de volume_step, sin bajar del mínimo)
             step, dec = info.volume_step, _decimals(info.volume_step)
@@ -261,7 +291,7 @@ class Executor:
                 "action": action, "symbol": symbol, "volume": vol, "type": otype,
                 "price": round(entry, dg), "sl": round(sl, dg), "tp": round(tp, dg),
                 "deviation": config.DEVIATION_POINTS, "magic": config.MAGIC,
-                "comment": f"tg{key.split(':')[-1]}"[:31], "type_time": mt5.ORDER_TIME_GTC,
+                "comment": self._comment(key), "type_time": mt5.ORDER_TIME_GTC,
             }
             if kind == "market":  # precio actual para mercado
                 req["price"] = round(mt5.symbol_info_tick(symbol).ask if buy else mt5.symbol_info_tick(symbol).bid, dg)
@@ -279,6 +309,7 @@ class Executor:
                f"SL {round(sl, dg)} | TP {', '.join(str(round(t, dg)) for t in tps_store if t) or '—'}"
                + (" (cierres parciales)" if mode == "parciales" and len(tps_store) > 1 else "") + "\n"
                f"Riesgo ≈ {real_risk:.2f} {acc.currency}")
+        msg += nota_margen
         if sl_prov:
             msg += "\n🛡️ La señal no traía SL: puesto uno provisional. Se cambiará cuando el grupo envíe el suyo."
         if instant and pasados:
@@ -331,16 +362,35 @@ class Executor:
             return f"[SIMULADO] {what} en {sig['symbol']}"
         return None
 
+    @staticmethod
+    def _resumen(accion, ok, errores, symbol):
+        """Texto del aviso según lo que el bróker aceptó de verdad."""
+        if not ok and not errores:
+            return f"{accion}: no quedan órdenes abiertas de {symbol}"
+        txt = f"{accion} en {symbol}: {ok} correcta(s)"
+        if errores:
+            txt = "⚠️ " + txt + f", {len(errores)} RECHAZADA(S) por el bróker ({'; '.join(map(str, errores))}). Revisa MT5"
+        return txt
+
     def move_sl(self, sig, new_sl):
         if (m := self._check_dry(sig, f"SL → {new_sl}")):
             return m
         pos, ords = self.live(sig["tickets"])
-        dg = mt5.symbol_info(sig["symbol"]).digits
+        info = mt5.symbol_info(sig["symbol"])
+        tick = mt5.symbol_info_tick(sig["symbol"])
+        sl = round(new_sl, info.digits)
+        ok, errores = 0, []
         for p in pos:
-            self._sltp(p, sl=round(new_sl, dg))
+            buy = p.type == mt5.POSITION_TYPE_BUY
+            if (buy and sl >= tick.bid) or (not buy and sl <= tick.ask):
+                errores.append(f"el precio ya ha pasado {sl}: cierra tú si quieres salir")
+                continue
+            t, err = self._sltp(p, sl=sl)
+            ok, errores = (ok + 1, errores) if t else (ok, errores + [err])
         for o in ords:
-            self._modify_order(o, sl=round(new_sl, dg))
-        return f"SL movido a {new_sl} en {sig['symbol']} ({len(pos) + len(ords)} órdenes)"
+            t, err = self._modify_order(o, sl=sl)
+            ok, errores = (ok + 1, errores) if t else (ok, errores + [err])
+        return self._resumen(f"SL movido a {sl}", ok, errores, sig["symbol"])
 
     def move_tp(self, sig, new_tps):
         if (m := self._check_dry(sig, f"TP → {new_tps}")):
@@ -350,18 +400,25 @@ class Executor:
             new_tps = [new_tps[-1]]  # una sola operación: el TP del servidor es el último
         items = sorted(pos + ords, key=lambda x: x.ticket)
         dg = mt5.symbol_info(sig["symbol"]).digits
+        ok, errores = 0, []
         for i, it in enumerate(items):
             tp = round(new_tps[min(i, len(new_tps) - 1)], dg)
-            (self._sltp(it, tp=tp) if it in pos else self._modify_order(it, tp=tp))
-        return f"TP actualizado en {sig['symbol']}: {new_tps}"
+            t, err = self._sltp(it, tp=tp) if it in pos else self._modify_order(it, tp=tp)
+            ok, errores = (ok + 1, errores) if t else (ok, errores + [err])
+        return self._resumen(f"TP actualizado a {new_tps}", ok, errores, sig["symbol"])
 
     def breakeven(self, sig):
+        """Pone el SL en la entrada. Devuelve (aviso, nº de posiciones que aún no se pudieron poner en BE
+        porque van perdiendo: el mantenimiento lo reintenta en cuanto vayan ganando)."""
         if (m := self._check_dry(sig, "Breakeven")):
-            return m
+            return m, 0
         pos, _ = self.live(sig["tickets"])
+        if not pos:
+            return f"Breakeven: no quedan posiciones abiertas de {sig['symbol']}", 0
         info = mt5.symbol_info(sig["symbol"])
         tick = mt5.symbol_info_tick(sig["symbol"])
-        done = ya = 0
+        done = ya = pendientes = 0
+        errores = []
         for p in pos:
             buy = p.type == mt5.POSITION_TYPE_BUY
             off = config.BE_OFFSET_POINTS * info.point
@@ -371,24 +428,33 @@ class Executor:
                 ya += 1
                 continue
             in_profit = tick.bid > be if buy else tick.ask < be
-            if in_profit:
-                t, _ = self._sltp(p, sl=be)
-                done += bool(t)
-        if not pos:
-            return f"Breakeven: no quedan posiciones abiertas de {sig['symbol']}"
+            if not in_profit:
+                pendientes += 1
+                continue
+            t, err = self._sltp(p, sl=be)
+            if t:
+                done += 1
+            else:
+                errores.append(err)
         if ya == len(pos):
-            return f"Breakeven: {sig['symbol']} ya estaba protegida en BE"
-        return f"Breakeven aplicado a {done + ya}/{len(pos)} posiciones de {sig['symbol']}"
+            return f"Breakeven: {sig['symbol']} ya estaba protegida en BE", 0
+        txt = f"🔒 Breakeven en {sig['symbol']}: {done + ya}/{len(pos)} protegida(s)"
+        if pendientes:
+            txt += (f"\n⏳ {pendientes} va(n) en pérdida y el SL no se puede poner en la entrada todavía: "
+                    "se pondrá solo en cuanto vaya ganando")
+        if errores:
+            txt += f"\n⚠️ Rechazado por el bróker: {'; '.join(map(str, errores))}. Revisa MT5"
+        return txt, pendientes
 
     def close_all(self, sig):
         if (m := self._check_dry(sig, "Cerrar todo")):
             return m
         pos, ords = self.live(sig["tickets"])
-        for p in pos:
-            self._close(p)
-        for o in ords:
-            self._cancel(o)
-        return f"Cerradas {len(pos)} posiciones y canceladas {len(ords)} pendientes de {sig['symbol']}"
+        ok, errores = 0, []
+        for it, fn in [(p, self._close) for p in pos] + [(o, self._cancel) for o in ords]:
+            t, err = fn(it)
+            ok, errores = (ok + 1, errores) if t else (ok, errores + [err])
+        return self._resumen("Cerrar todo", ok, errores, sig["symbol"])
 
     def close_at_be(self, sig):
         """'Cerrar a BE': si está en la entrada o ganando se cierra ya; si va perdiendo, TP en la entrada."""
@@ -402,20 +468,25 @@ class Executor:
         info = mt5.symbol_info(sig["symbol"])
         tick = mt5.symbol_info_tick(sig["symbol"])
         cerradas = esperando = 0
+        errores = []
         for p in pos:
             buy = p.type == mt5.POSITION_TYPE_BUY
             if (tick.bid >= p.price_open) if buy else (tick.ask <= p.price_open):
-                t, _ = self._close(p)
+                t, err = self._close(p)
                 cerradas += bool(t)
             else:
-                t, _ = self._sltp(p, tp=round(p.price_open, info.digits))
+                t, err = self._sltp(p, tp=round(p.price_open, info.digits))
                 esperando += bool(t)
+            if not t:
+                errores.append(err)
         partes = []
         if cerradas:
             partes.append(f"{cerradas} cerrada(s) ya en BE o ganando")
         if esperando:
             partes.append(f"{esperando} con el TP puesto en la entrada (se cerrará sola al volver a ese precio)")
-        return f"🔒 Cerrar a BE en {sig['symbol']}: " + ("; ".join(partes) or "no se pudo modificar")
+        if errores:
+            partes.append(f"⚠️ {len(errores)} rechazada(s) por el bróker ({'; '.join(map(str, errores))}). Revisa MT5")
+        return f"🔒 Cerrar a BE en {sig['symbol']}: " + "; ".join(partes)
 
     def close_partial(self, sig, pct):
         if (m := self._check_dry(sig, f"Cierre parcial {pct}%")):
@@ -428,20 +499,25 @@ class Executor:
         pos.sort(key=lambda p: abs((p.tp or 1e12) - (tick.bid + tick.ask) / 2))
         target = sum(p.volume for p in pos) * pct / 100
         closed = 0.0
+        errores = []
         for p in pos:
             remaining = target - closed
             if remaining <= 1e-9:
                 break
-            if p.volume <= remaining + 1e-9:
-                self._close(p)
-                closed += p.volume
-            else:
-                v = self.normalize_volume(p.symbol, remaining)
-                if v > 0:
-                    self._close(p, v)
-                    closed += v
+            v = p.volume if p.volume <= remaining + 1e-9 else self.normalize_volume(p.symbol, remaining)
+            if v <= 0:
                 break
-        return f"Cerrado parcial {closed} lotes ({pct}%) de {sig['symbol']}"
+            t, err = self._close(p, v)
+            if t:
+                closed += v
+            else:
+                errores.append(err)
+            if v < p.volume:
+                break
+        txt = f"Cerrado parcial {round(closed, 2)} lotes ({pct}%) de {sig['symbol']}"
+        if errores:
+            txt = "⚠️ " + txt + f". Rechazado por el bróker: {'; '.join(map(str, errores))}. Revisa MT5"
+        return txt
 
     def only_pending(self, sig):
         """True si la señal solo tiene órdenes pendientes (aún no se ha abierto ninguna posición)."""
@@ -455,9 +531,11 @@ class Executor:
         if (m := self._check_dry(sig, "Cancelar pendientes")):
             return m
         _, ords = self.live(sig["tickets"])
+        ok, errores = 0, []
         for o in ords:
-            self._cancel(o)
-        return f"Canceladas {len(ords)} órdenes pendientes de {sig['symbol']}"
+            t, err = self._cancel(o)
+            ok, errores = (ok + 1, errores) if t else (ok, errores + [err])
+        return self._resumen("Cancelar pendientes", ok, errores, sig["symbol"])
 
     # ------------------------------------------------------------------ cierres parciales (modo una sola operación)
     def _partial_pcts(self, n):
@@ -501,9 +579,11 @@ class Executor:
                 notes.append(f"💰 TP{hits + 1} {p.symbol}: lote demasiado pequeño para cerrar parcial")
             hits += 1
             if hits == 1 and config.MOVE_BE_ON_TP1 and not sig.get("be_done"):
-                notes.append("🔒 " + self.breakeven(sig))
-                sig["be_done"] = True
-        store.update(sig["id"], tp_hits=hits, be_done=sig.get("be_done", False))
+                txt, pendientes = self.breakeven(sig)
+                notes.append(txt)
+                sig["be_done"], sig["be_pending"] = True, bool(pendientes)
+        store.update(sig["id"], tp_hits=hits, be_done=sig.get("be_done", False),
+                     be_pending=sig.get("be_pending", False))
         return notes
 
     # ------------------------------------------------------------------ mantenimiento periódico
@@ -534,6 +614,12 @@ class Executor:
                         self._cancel(o)
                     notes.append(f"⌛ Pendiente de {sig['symbol']} cancelada: el precio llegó al TP1 ({tp1}) sin entrar")
                     continue
+            if sig.get("be_pending") and pos:
+                # El grupo pidió BE cuando íbamos en pérdida: ponerlo en cuanto la operación vaya ganando
+                txt, pendientes = self.breakeven(sig)
+                if not pendientes:
+                    store.update(sig["id"], be_pending=False)
+                    notes.append("⏳ BE pendiente → " + txt)
             if sig.get("mode") == "parciales":
                 notes += self.take_partials(sig, store)
                 continue
@@ -542,6 +628,44 @@ class Executor:
                 gone = [t for t in real if t not in live_ids]
                 won = any(sum(d.profit for d in (mt5.history_deals_get(position=t) or [])) > 0 for t in gone)
                 if won:
-                    notes.append("🔒 TP1 tocado → " + self.breakeven(sig))
-                    store.update(sig["id"], be_done=True)
+                    txt, pendientes = self.breakeven(sig)
+                    notes.append("TP1 tocado → " + txt)
+                    store.update(sig["id"], be_done=True, be_pending=bool(pendientes))
         return notes
+
+    # ------------------------------------------------------------------ salud y estado
+    def health(self):
+        """None si MT5 no responde; "" si todo va bien; un aviso (solo una vez) si hay algo que revisar."""
+        acc = mt5.account_info()
+        term = mt5.terminal_info()
+        if acc is None or term is None:
+            return None
+        aviso = ""
+        if not term.trade_allowed and not getattr(self, "_aviso_algo", False):
+            aviso = "⚠️ 'Algo Trading' está desactivado en MT5: el bot NO puede operar. Actívalo (botón de arriba)."
+        self._aviso_algo = not term.trade_allowed
+        return aviso
+
+    def reconnect(self):
+        try:
+            mt5.shutdown()
+            self.connect()
+        except Exception as e:  # noqa: BLE001
+            log.warning("Reconexión con MT5 fallida: %s", e)
+
+    def status_text(self, store):
+        acc = mt5.account_info()
+        if acc is None:
+            return "⚠️ Bot vivo pero SIN conexión con MT5"
+        lineas = [f"📟 Bot funcionando · {acc.server}",
+                  f"Balance {acc.balance:,.2f} · Equidad {acc.equity:,.2f} · "
+                  f"Margen libre {acc.margin_free:,.0f} {acc.currency}"]
+        mias = [p for p in (mt5.positions_get() or []) if p.magic == config.MAGIC]
+        if not mias:
+            lineas.append("Sin operaciones del bot abiertas")
+        for p in mias:
+            lado = "BUY" if p.type == mt5.POSITION_TYPE_BUY else "SELL"
+            lineas.append(f"• {lado} {p.symbol} {p.volume} @ {p.price_open} | SL {p.sl or '-'} TP {p.tp or '-'} | "
+                          f"{p.profit:+.2f} {acc.currency}")
+        lineas.append(f"Señales activas en memoria: {len(store.active())}")
+        return "\n".join(lineas)

@@ -98,12 +98,13 @@ Abre `.env` con el Bloc de notas y rellena tus datos.
 | Variable | Qué hace |
 |---|---|
 | `RISK_PERCENT` | % del balance que arriesgas por señal (suma de todas sus posiciones) |
-| `DAILY_LOSS_LIMIT_PERCENT` | Si la equity cae este % en el día, no abre más operaciones |
+| `LOT_PER_100` / `MAX_LOT` | Lote fijo por cada 100 € de balance (0 = usar `RISK_PERCENT`) / lote máximo por señal. Si no hay margen libre, el lote se reduce solo |
+| `DAILY_LOSS_LIMIT_PERCENT` | Si la equity cae este % en el día, no abre más operaciones (0 = desactivado) |
 | `MAX_OPEN_SIGNALS` | Máximo de señales abiertas a la vez |
-| `SPLIT_TPS` / `MAX_TPS` | Una posición por TP / cuántos TP usar como máximo |
+| `TP_MODE` / `MAX_TPS` | `parciales`, `dividir` o `primero` / cuántos TP usar como máximo |
 | `MOVE_BE_ON_TP1` | Breakeven automático al tocar TP1 |
 | `DEFAULT_SL_POINTS` | SL por defecto si la señal llega sin SL (0 = no operarla) |
-| `ENTRY_TOLERANCE_POINTS` | Cuánto puede haberse ido el precio antes de usar una limit |
+| `ENTRY_TOLERANCE_POINTS` | Solo para órdenes stop: cuánto puede haberse pasado el precio del nivel |
 | `MIN_CONFIDENCE` | Por debajo de esta confianza de la IA, no ejecuta y te avisa |
 | `PIP_SIZES` | Tamaño de un pip, si el grupo da SL/TP en pips |
 

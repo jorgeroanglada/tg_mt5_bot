@@ -25,7 +25,8 @@ MOTIVO = {
 }
 
 deals = mt5.history_deals_get(datetime.now() - timedelta(days=dias), datetime.now() + timedelta(days=1)) or []
-deals = [d for d in deals if d.magic == config.MAGIC or d.comment.startswith("tg")]
+del_bot = {d.position_id for d in deals if d.entry == 0 and (d.magic == config.MAGIC or d.comment.startswith("tg"))}
+deals = [d for d in deals if d.position_id in del_bot]  # incluye los cierres que haces tú a mano
 if not deals:
     print("No hay operaciones del bot en ese periodo.")
 for d in sorted(deals, key=lambda d: d.time):

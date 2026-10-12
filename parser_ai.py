@@ -151,6 +151,48 @@ def _clean(data):
     return {"acciones": out, "confianza": _num(data.get("confianza")) or 0, "motivo": data.get("motivo", "")}
 
 
+_N = r"\d+(?:[.,]\d+)?"
+_HEAD = re.compile(
+    rf"^\s*(?P<sym>[A-Z][A-Z0-9]{{2,9}})\s+(?P<dir>BUY|SELL)(?:\s+(?P<kind>NOW|LIMIT|STOP))?"
+    rf"\s*(?:@|:|AT)?\s*(?P<e1>{_N})(?:\s*[-/]\s*(?P<e2>{_N}))?")
+_ITEM = re.compile(rf"\b(?P<k>TP\d?|SL)\s*[:=@.]?\s*(?P<v>{_N}|OPEN)\b")  # "TP1 2355", "TP 4172"
+_RESERVED = {"TP", "SL", "BUY", "SELL", "CERRAR", "MOVER"}
+
+
+def _f(x):
+    return float(x.replace(",", "."))
+
+
+def parse_simple(text):
+    """Lee sin IA las señales con el formato estándar del grupo:
+    'XAUUSD SELL 4177 TP 4172 SL 4200', 'GOLD BUY NOW 2350-2347 SL 2340 TP1 2355 TP2 2365'...
+    Si sobra cualquier palabra que no entienda, devuelve None y el mensaje lo lee la IA."""
+    t = re.sub(r"[^A-Z0-9.,:@/=\-\s]", " ", (text or "").upper())  # quita emojis y símbolos
+    m = _HEAD.match(t)
+    if not m or m["sym"] in _RESERVED:
+        return None
+    rest = t[m.end():]
+    sl, tps = None, []
+    for it in _ITEM.finditer(rest):
+        v = it["v"]
+        if it["k"] == "SL":
+            if v == "OPEN" or sl is not None:
+                return None
+            sl = _f(v)
+        elif v != "OPEN":
+            tps.append(_f(v))
+    if re.sub(r"[\s:=@.,\-/]", "", _ITEM.sub(" ", rest)):
+        return None  # hay más texto del que entiendo: mejor que lo lea la IA
+    e1 = _f(m["e1"])
+    e2 = _f(m["e2"]) if m["e2"] else e1
+    kind = {"LIMIT": "limit", "STOP": "stop"}.get(m["kind"] or "", "market")
+    accion = {"tipo": "abrir", "simbolo": m["sym"], "direccion": m["dir"].lower(), "tipo_orden": kind,
+              "entrada_min": min(e1, e2), "entrada_max": max(e1, e2), "sl": sl, "sl_pips": None,
+              "tps": tps, "tps_pips": [], "nuevo_sl": None, "nuevos_tps": [], "porcentaje": None,
+              "tp_numero": None, "objetivo": None, "senal_ids": []}
+    return {"acciones": [accion], "confianza": 1.0, "motivo": "Formato estándar leído sin IA"}
+
+
 def _extract_json(text):
     text = (text or "").strip()
     try:
@@ -190,6 +232,10 @@ class SignalParser:
         return "\n\n".join(parts)
 
     async def parse(self, text, reply_text=None, open_signals=None):
+        # El formato típico del grupo se lee directamente: instantáneo, gratis y sin errores de la IA
+        simple = parse_simple(text)
+        if simple:
+            return simple
         user = self._prompt(text, reply_text, open_signals)
         if self.provider == "anthropic":
             res = _clean(await self._anthropic(user))
@@ -252,4 +298,5 @@ class SignalParser:
                     await asyncio.sleep(20)
                     continue
                 raise
-        return {}
+        # Nunca devolver "sin acciones" en silencio: el bot avisará de que el mensaje NO se ha procesado
+        raise RuntimeError("la IA no ha respondido bien tras 3 intentos")
