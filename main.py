@@ -182,6 +182,8 @@ class Bot:
                 out = self.ex.close_all(s)
                 if all(t < 0 for t in s["tickets"]):
                     self.store.update(s["id"], closed=True)
+            elif tipo == "cerrar_be":
+                out = self.ex.close_at_be(s)
             elif tipo == "cerrar_parcial":
                 out = self.ex.close_partial(s, a.get("porcentaje") or 50)
             elif tipo == "cancelar_pendiente":

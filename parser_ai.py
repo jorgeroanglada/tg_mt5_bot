@@ -24,7 +24,7 @@ TOOL = {
                         "tipo": {
                             "type": "string",
                             "enum": ["abrir", "mover_sl", "mover_tp", "breakeven", "cerrar_todo",
-                                     "cerrar_parcial", "cancelar_pendiente", "tp_alcanzado"],
+                                     "cerrar_be", "cerrar_parcial", "cancelar_pendiente", "tp_alcanzado"],
                         },
                         "simbolo": {"type": ["string", "null"], "description": "Tal como aparece: XAUUSD, GOLD, NAS100..."},
                         "direccion": {"type": ["string", "null"], "enum": ["buy", "sell", None]},
@@ -72,10 +72,12 @@ Reglas:
   * "mover SL a 2345" -> "mover_sl" con nuevo_sl. Cambiar TP -> "mover_tp" con nuevos_tps.
   * Un mensaje que solo da el SL ("SL 4170", "SL: 4170") es el SL que faltaba de la última señal -> "mover_sl" con
     nuevo_sl (objetivo "respondido" si responde a la señal, si no "ultima").
+  * "cerrar a BE", "cerrar en BE", "cerrar en entrada", "close at BE" -> "cerrar_be" (NO es "breakeven": pide CERRAR).
   * "cerrar", "close now", "salir" -> "cerrar_todo". "cerrar la mitad / parciales / 50%" -> "cerrar_parcial" con porcentaje.
   * "TP1 hit ✅", "TP2 alcanzado" -> "tp_alcanzado" con tp_numero.
   * "cancelar la orden / delete limit" -> "cancelar_pendiente".
   * Un mismo mensaje puede tener varias acciones (p.ej. cerrar parcial + breakeven).
+  * Si el mensaje es una señal nueva ("abrir"), devuelve SOLO la acción "abrir": nunca añadas otras acciones vacías.
   * objetivo: "respondido" si el mensaje responde a una señal; "simbolo" si nombra un símbolo concreto; "todas" si dice todas; si no, "ultima".
   * Si en las señales abiertas reconoces claramente a cuál se refiere, pon su id en senal_ids.
 - confianza: lo seguro que estás de la interpretación (baja si es ambiguo)."""
@@ -86,7 +88,7 @@ JSON_INSTRUCTIONS = """
 Responde ÚNICAMENTE con un objeto JSON válido (sin texto antes ni después, sin ```), con esta forma:
 {"acciones": [ {"tipo": "...", ...campos...} ], "confianza": 0.0-1.0, "motivo": "explicación breve"}
 Campos posibles de cada acción (pon null o [] si no aplican):
-tipo (abrir|mover_sl|mover_tp|breakeven|cerrar_todo|cerrar_parcial|cancelar_pendiente|tp_alcanzado),
+tipo (abrir|mover_sl|mover_tp|breakeven|cerrar_todo|cerrar_be|cerrar_parcial|cancelar_pendiente|tp_alcanzado),
 simbolo, direccion (buy|sell), tipo_orden (market|limit|stop), entrada_min, entrada_max, sl, sl_pips,
 tps [números], tps_pips [números], nuevo_sl, nuevos_tps [números], porcentaje, tp_numero,
 objetivo (respondido|ultima|simbolo|todas), senal_ids [textos].
@@ -195,6 +197,15 @@ class SignalParser:
             res = _clean(await self._openai_compat(user))
         # Regla del grupo: si no pone LIMIT (o BUY/SELL STOP), es SIEMPRE ejecución por mercado
         low = text.lower()
+        # Una señal nueva nunca trae gestión en el mismo mensaje: la IA a veces añade acciones vacías
+        # (p.ej. un "cerrar_todo" que cerraba la operación recién abierta)
+        if any(a["tipo"] == "abrir" for a in res["acciones"]):
+            res["acciones"] = [a for a in res["acciones"] if a["tipo"] == "abrir"]
+        # "Cerrar a BE" pide cerrar en la entrada, no solo mover el SL
+        if re.search(r"cerra\w*\s+(a|en)\s+(el\s+)?(be|break\s*even|entrada)\b", low):
+            for a in res["acciones"]:
+                if a["tipo"] in ("breakeven", "cerrar_todo"):
+                    a["tipo"] = "cerrar_be"
         for a in res["acciones"]:
             if a["tipo"] == "abrir":
                 if (a.get("tipo_orden") == "limit" and "limit" not in low) or \

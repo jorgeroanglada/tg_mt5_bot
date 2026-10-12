@@ -390,6 +390,33 @@ class Executor:
             self._cancel(o)
         return f"Cerradas {len(pos)} posiciones y canceladas {len(ords)} pendientes de {sig['symbol']}"
 
+    def close_at_be(self, sig):
+        """'Cerrar a BE': si está en la entrada o ganando se cierra ya; si va perdiendo, TP en la entrada."""
+        if (m := self._check_dry(sig, "Cerrar a BE")):
+            return m
+        pos, ords = self.live(sig["tickets"])
+        for o in ords:
+            self._cancel(o)
+        if not pos:
+            return f"Cerrar a BE: no quedan posiciones abiertas de {sig['symbol']}"
+        info = mt5.symbol_info(sig["symbol"])
+        tick = mt5.symbol_info_tick(sig["symbol"])
+        cerradas = esperando = 0
+        for p in pos:
+            buy = p.type == mt5.POSITION_TYPE_BUY
+            if (tick.bid >= p.price_open) if buy else (tick.ask <= p.price_open):
+                t, _ = self._close(p)
+                cerradas += bool(t)
+            else:
+                t, _ = self._sltp(p, tp=round(p.price_open, info.digits))
+                esperando += bool(t)
+        partes = []
+        if cerradas:
+            partes.append(f"{cerradas} cerrada(s) ya en BE o ganando")
+        if esperando:
+            partes.append(f"{esperando} con el TP puesto en la entrada (se cerrará sola al volver a ese precio)")
+        return f"🔒 Cerrar a BE en {sig['symbol']}: " + ("; ".join(partes) or "no se pudo modificar")
+
     def close_partial(self, sig, pct):
         if (m := self._check_dry(sig, f"Cierre parcial {pct}%")):
             return m
