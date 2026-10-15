@@ -1,5 +1,7 @@
 # Bot de señales Telegram → MetaTrader 5
 
+[![Pruebas](https://github.com/jorgeroanglada/tg_mt5_bot/actions/workflows/pruebas.yml/badge.svg)](https://github.com/jorgeroanglada/tg_mt5_bot/actions/workflows/pruebas.yml)
+
 Lee los mensajes de un grupo/canal de Telegram (con tu propia cuenta, no hace falta ser admin), los interpreta con IA **gratuita** (Gemini o Groq) aunque cada mensaje tenga un formato distinto, y abre o gestiona las operaciones en MT5.
 
 > **Proyecto personal de aprendizaje**, probado solo en cuenta demo. No es asesoramiento financiero ni un sistema rentable: es un ejercicio de automatización con IA y de cómo ponerle límites.
@@ -10,7 +12,18 @@ Lee los mensajes de un grupo/canal de Telegram (con tu propia cuenta, no hace fa
 
 **La solución:** una IA convierte cada mensaje en una acción concreta en JSON (abrir, mover stop, cerrar parcial...). Si no está segura, no hace nada y avisa.
 
-**Cifras:** 9 archivos de Python (1.364 líneas), montado en dos días con Claude Code. 245 mensajes interpretados en sus primeros días.
+**Cifras:** 10 archivos de Python (~2.000 líneas) con 16 pruebas automáticas, montado con Claude Code. 245 mensajes interpretados en sus primeros días.
+
+### Pruébalo en 1 minuto (sin MT5, sin Telegram, sin claves)
+
+```bash
+git clone https://github.com/jorgeroanglada/tg_mt5_bot.git
+cd tg_mt5_bot
+pip install python-dotenv
+python pruebas.py
+```
+
+Las pruebas comprueban el lector de señales, el filtro de las respuestas de la IA y a qué operación se aplica cada mensaje de gestión. Se ejecutan solas en cada `push` con GitHub Actions. Para usar el bot de verdad, sigue [Instalación](#instalación).
 
 ### Cómo funciona
 
@@ -114,6 +127,7 @@ Abre `.env` con el Bloc de notas y rellena tus datos.
 - `parser_ai.py`: la IA que convierte el texto en acciones (aquí puedes añadir reglas y ejemplos propios del grupo)
 - `executor.py`: abre, modifica y cierra en MT5
 - `store.py`: guarda en `estado.json` qué mensaje corresponde a qué operación
+- `pruebas.py`: pruebas automáticas (`python pruebas.py`), no necesitan MT5, Telegram ni IA
 - `bot.log`: registro de todo lo que pasa
 
 ## Cosas a tener en cuenta
